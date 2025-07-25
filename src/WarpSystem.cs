@@ -336,40 +336,84 @@ namespace WarpMod
         {
             try
             {
-                // Try to load new combined format first
-                var loadedWarpModData = serverApi.LoadModConfig<WarpModData>("warpmod_data_v2.json");
-                if (loadedWarpModData != null)
+                // Try to load world-specific data from world save file
+                byte[] worldData = serverApi.WorldManager.SaveGame.GetData("warpmod_data");
+                if (worldData != null)
                 {
-                    playerWarps = loadedWarpModData.PlayerWarps ?? new Dictionary<string, Dictionary<string, WarpData>>();
-                    playerSharingEnabled = loadedWarpModData.PlayerSharingEnabled ?? new Dictionary<string, bool>();
-                    return;
-                }
-
-                // Fallback: Try to load old player-based format
-                var loadedPlayerData = serverApi.LoadModConfig<Dictionary<string, Dictionary<string, WarpData>>>("warpmod_player_data.json");
-                if (loadedPlayerData != null)
-                {
-                    playerWarps = loadedPlayerData;
-                    // Default all existing players to sharing enabled for backward compatibility
-                    foreach (var playerUID in playerWarps.Keys)
+                    try
                     {
-                        if (!playerSharingEnabled.ContainsKey(playerUID))
+                        string jsonData = System.Text.Encoding.UTF8.GetString(worldData);
+                        // Use a simple approach - leverage VS's existing JSON handling through a temporary mod config
+                        string tempFileName = $"warpmod_temp_load_{Guid.NewGuid():N}.json";
+                        System.IO.File.WriteAllText(System.IO.Path.Combine(serverApi.GetOrCreateDataPath("ModConfig"), tempFileName), jsonData);
+                        var loadedWarpModData = serverApi.LoadModConfig<WarpModData>(tempFileName);
+                        System.IO.File.Delete(System.IO.Path.Combine(serverApi.GetOrCreateDataPath("ModConfig"), tempFileName));
+                        
+                        if (loadedWarpModData != null)
                         {
-                            playerSharingEnabled[playerUID] = true;
+                            playerWarps = loadedWarpModData.PlayerWarps ?? new Dictionary<string, Dictionary<string, WarpData>>();
+                            playerSharingEnabled = loadedWarpModData.PlayerSharingEnabled ?? new Dictionary<string, bool>();
+                            serverApi.Logger.Debug("Loaded world-specific warp data successfully");
+                            return;
                         }
                     }
-                    SaveWarpData(); // Save in new format
-                    serverApi.Logger.Warning("Migrated warp data from old player-based format to new combined format");
-                    return;
+                    catch (Exception ex)
+                    {
+                        serverApi.Logger.Error($"Failed to deserialize world-specific warp data: {ex.Message}");
+                    }
                 }
 
-                // Fallback: Try to migrate from old group-based format
-                var loadedGroupData = serverApi.LoadModConfig<Dictionary<string, Dictionary<string, WarpData>>>("warpmod_data.json");
-                if (loadedGroupData != null)
+                // Check if this world has already been migrated by looking for a migration marker
+                byte[] migrationMarker = serverApi.WorldManager.SaveGame.GetData("warpmod_migrated");
+                if (migrationMarker == null)
                 {
-                    MigrateFromGroupFormat(loadedGroupData);
-                    SaveWarpData(); // Save in new format
-                    serverApi.Logger.Warning("Migrated warp data from old group-based format to new combined format");
+                    // Migration: Check for existing global mod config data and migrate it to world-specific storage
+                    var globalWarpModData = serverApi.LoadModConfig<WarpModData>("warpmod_data_v2.json");
+                    if (globalWarpModData != null)
+                    {
+                        playerWarps = globalWarpModData.PlayerWarps ?? new Dictionary<string, Dictionary<string, WarpData>>();
+                        playerSharingEnabled = globalWarpModData.PlayerSharingEnabled ?? new Dictionary<string, bool>();
+                        SaveWarpData(); // Save to world-specific storage
+                        // Mark this world as migrated
+                        serverApi.WorldManager.SaveGame.StoreData("warpmod_migrated", System.Text.Encoding.UTF8.GetBytes("true"));
+                        serverApi.Logger.Warning("Migrated global warp data to world-specific storage");
+                        return;
+                    }
+
+                    // Fallback: Try to migrate from old player-based format
+                    var loadedPlayerData = serverApi.LoadModConfig<Dictionary<string, Dictionary<string, WarpData>>>("warpmod_player_data.json");
+                    if (loadedPlayerData != null)
+                    {
+                        playerWarps = loadedPlayerData;
+                        // Default all existing players to sharing enabled for backward compatibility
+                        foreach (var playerUID in playerWarps.Keys)
+                        {
+                            if (!playerSharingEnabled.ContainsKey(playerUID))
+                            {
+                                playerSharingEnabled[playerUID] = true;
+                            }
+                        }
+                        SaveWarpData(); // Save in world-specific format
+                        // Mark this world as migrated
+                        serverApi.WorldManager.SaveGame.StoreData("warpmod_migrated", System.Text.Encoding.UTF8.GetBytes("true"));
+                        serverApi.Logger.Warning("Migrated warp data from old player-based format to world-specific storage");
+                        return;
+                    }
+
+                    // Fallback: Try to migrate from old group-based format
+                    var loadedGroupData = serverApi.LoadModConfig<Dictionary<string, Dictionary<string, WarpData>>>("warpmod_data.json");
+                    if (loadedGroupData != null)
+                    {
+                        MigrateFromGroupFormat(loadedGroupData);
+                        SaveWarpData(); // Save in world-specific format
+                        // Mark this world as migrated
+                        serverApi.WorldManager.SaveGame.StoreData("warpmod_migrated", System.Text.Encoding.UTF8.GetBytes("true"));
+                        serverApi.Logger.Warning("Migrated warp data from old group-based format to world-specific storage");
+                        return;
+                    }
+
+                    // No data to migrate, mark as migrated anyway to prevent future migration attempts
+                    serverApi.WorldManager.SaveGame.StoreData("warpmod_migrated", System.Text.Encoding.UTF8.GetBytes("true"));
                 }
             }
             catch (Exception e)
@@ -407,7 +451,20 @@ namespace WarpMod
                     PlayerWarps = playerWarps,
                     PlayerSharingEnabled = playerSharingEnabled
                 };
-                serverApi.StoreModConfig(warpModData, "warpmod_data_v2.json");
+
+                // Save to world-specific storage using world data APIs
+                string tempFileName = $"warpmod_temp_save_{Guid.NewGuid():N}.json";
+                string tempFilePath = System.IO.Path.Combine(serverApi.GetOrCreateDataPath("ModConfig"), tempFileName);
+                
+                // Use VS's StoreModConfig to generate proper JSON, then read it back
+                serverApi.StoreModConfig(warpModData, tempFileName);
+                string jsonData = System.IO.File.ReadAllText(tempFilePath);
+                System.IO.File.Delete(tempFilePath);
+                
+                // Store in world-specific storage
+                byte[] dataBytes = System.Text.Encoding.UTF8.GetBytes(jsonData);
+                serverApi.WorldManager.SaveGame.StoreData("warpmod_data", dataBytes);
+                serverApi.Logger.Debug("Saved warp data to world-specific storage");
             }
             catch (Exception e)
             {
