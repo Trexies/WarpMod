@@ -12,30 +12,6 @@ A mod that adds personal waypoint/warp functionality to Vintagestory, allowing p
 - Group-based waypoint sharing (players in the same group can use each other's waypoints)
 - Automatic waypoint name conflict resolution
 
-## Installation
-
-1. Download the latest release
-2. Extract `WarpMod.dll` to your Vintagestory mods folder
-3. Restart your Vintagestory server
-
-## Building from Source
-
-### Standard Setup (Recommended)
-
-For most users with a standard Vintagestory installation:
-
-1. Clone this repository
-2. Run `dotnet build` or build through Visual Studio
-3. The project will automatically find Vintagestory in `%APPDATA%\Vintagestory`
-
-### Custom Installation Paths
-
-If you have Vintagestory installed in a custom location:
-
-1. Copy `WarpMod.props.example` to `WarpMod.props`
-2. Edit `WarpMod.props` and update the `VintagestoryPath` to your installation directory
-3. Build the project
-
 ## Commands
 
 - `/warp <name>` - Teleport to a waypoint
