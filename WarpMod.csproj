@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  
+  <!-- Import optional custom configuration -->
+  <Import Project="WarpMod.props" Condition="Exists('WarpMod.props')" />
+  
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <!-- Default Vintagestory path - can be overridden in WarpMod.props -->
+    <VintagestoryPath Condition="'$(VintagestoryPath)' == ''">$(APPDATA)\Vintagestory</VintagestoryPath>
+  </PropertyGroup>
+  
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI">
+      <HintPath>$(VintagestoryPath)\VintagestoryAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="VSSurvivalMod">
+      <HintPath>$(VintagestoryPath)\Mods\VSSurvivalMod.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

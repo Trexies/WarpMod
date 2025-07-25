@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <!-- 
+    Custom Vintagestory installation path
+    Copy this file to "WarpMod.props" and modify the path below if needed.
+    
+    Examples:
+    - Default (automatic): Uses %APPDATA%\Vintagestory
+    - Custom installation: D:\Games\Vintagestory
+    - Steam installation: C:\Program Files (x86)\Steam\steamapps\common\VintageStory
+    -->
+    <VintagestoryPath>C:\Your\Custom\Path\To\Vintagestory</VintagestoryPath>
+  </PropertyGroup>
+</Project>
