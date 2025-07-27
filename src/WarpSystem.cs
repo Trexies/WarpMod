@@ -41,12 +41,14 @@ namespace WarpMod
         private ICoreServerAPI serverApi;
         private Dictionary<string, Dictionary<string, WarpData>> playerWarps; // playerUID -> warpName -> warpData
         private Dictionary<string, bool> playerSharingEnabled; // playerUID -> sharing enabled/disabled
+        private Dictionary<string, Vec3d> playerPreviousLocations; // playerUID -> previous location before warp
 
         public override void StartServerSide(ICoreServerAPI api)
         {
             serverApi = api;
             playerWarps = new Dictionary<string, Dictionary<string, WarpData>>();
             playerSharingEnabled = new Dictionary<string, bool>();
+            playerPreviousLocations = new Dictionary<string, Vec3d>();
 
             RegisterCommands();
             LoadWarpData();
@@ -54,6 +56,81 @@ namespace WarpMod
             // Save data when server shuts down or world is saved
             serverApi.Event.SaveGameLoaded += () => LoadWarpData();
             serverApi.Event.GameWorldSave += () => SaveWarpData();
+
+            // Start universal teleport tracking system
+            StartTeleportTracking();
+        }
+
+        private Dictionary<string, Vec3d> playerLastKnownPositions; // Track last known positions for teleport detection
+        private Dictionary<string, long> playerLastPositionUpdate; // Track when position was last updated
+
+        private void StartTeleportTracking()
+        {
+            playerLastKnownPositions = new Dictionary<string, Vec3d>();
+            playerLastPositionUpdate = new Dictionary<string, long>();
+
+            // Start a repeating timer to check for teleportation every 200ms
+            serverApi.Event.RegisterGameTickListener((dt) =>
+            {
+                CheckForTeleportations();
+            }, 200);
+
+            serverApi.Logger.Debug("Universal teleport tracking system started");
+        }
+
+        private void CheckForTeleportations()
+        {
+            try
+            {
+                var onlinePlayers = serverApi.World.AllOnlinePlayers;
+                if (onlinePlayers == null) return;
+
+                foreach (IServerPlayer player in onlinePlayers)
+                {
+                    if (player?.Entity?.ServerPos == null) continue;
+
+                    string playerUID = player.PlayerUID;
+                    Vec3d currentPos = player.Entity.ServerPos.XYZ;
+                    long currentTime = serverApi.World.ElapsedMilliseconds;
+
+                    // Skip if player just joined or respawned
+                    if (!playerLastKnownPositions.ContainsKey(playerUID))
+                    {
+                        playerLastKnownPositions[playerUID] = currentPos;
+                        playerLastPositionUpdate[playerUID] = currentTime;
+                        continue;
+                    }
+
+                    Vec3d lastPos = playerLastKnownPositions[playerUID];
+                    long lastUpdate = playerLastPositionUpdate[playerUID];
+                    double timeDiff = currentTime - lastUpdate;
+
+                    // Calculate distance moved
+                    double distance = currentPos.DistanceTo(lastPos);
+
+                    // Detect teleportation: significant distance (>15 blocks) in short time (<500ms)
+                    // This filters out normal movement but catches teleports
+                    if (distance > 15.0 && timeDiff < 500)
+                    {
+                        // Check if this wasn't a /back command (avoid storing position during /back)
+                        if (!playerPreviousLocations.ContainsKey(playerUID) || 
+                            playerPreviousLocations[playerUID].DistanceTo(currentPos) > 5.0)
+                        {
+                            // Store the previous position for /back
+                            playerPreviousLocations[playerUID] = lastPos;
+                            serverApi.Logger.Debug($"Detected teleportation for {player.PlayerName}: {(int)lastPos.X}, {(int)lastPos.Y}, {(int)lastPos.Z} -> {(int)currentPos.X}, {(int)currentPos.Y}, {(int)currentPos.Z}");
+                        }
+                    }
+
+                    // Update tracking data
+                    playerLastKnownPositions[playerUID] = currentPos;
+                    playerLastPositionUpdate[playerUID] = currentTime;
+                }
+            }
+            catch (Exception e)
+            {
+                serverApi.Logger.Error($"Error in teleport tracking: {e.Message}");
+            }
         }
 
         private void RegisterCommands()
@@ -70,6 +147,12 @@ namespace WarpMod
                 .RequiresPlayer()
                 .RequiresPrivilege(Privilege.tp)
                 .HandleWith(OnWarpsCommand);
+
+            serverApi.ChatCommands.Create("back")
+                .WithDescription("Teleport back to your location prior to the last teleportation")
+                .RequiresPlayer()
+                .RequiresPrivilege(Privilege.tp)
+                .HandleWith(OnBackCommand);
         }
 
         private List<string> GetGroupMemberUIDs(IServerPlayer player)
@@ -183,6 +266,30 @@ namespace WarpMod
             return ListWarps(player);
         }
 
+        private TextCommandResult OnBackCommand(TextCommandCallingArgs args)
+        {
+            IServerPlayer player = args.Caller.Player as IServerPlayer;
+            if (player == null) return TextCommandResult.Error("Command can only be used by players");
+
+            string playerUID = player.PlayerUID;
+
+            // Check if player has a previous location stored
+            if (!playerPreviousLocations.ContainsKey(playerUID))
+            {
+                return TextCommandResult.Error("No previous location available. Use any teleport command first.");
+            }
+
+            Vec3d previousPos = playerPreviousLocations[playerUID];
+
+            // Teleport the player to their previous location
+            player.Entity.TeleportToDouble(previousPos.X, previousPos.Y, previousPos.Z);
+
+            // Clear the previous location so /back can only be used once per warp
+            playerPreviousLocations.Remove(playerUID);
+
+            return TextCommandResult.Success($"Teleported back to your previous location: {(int)previousPos.X}, {(int)previousPos.Y}, {(int)previousPos.Z}");
+        }
+
         private TextCommandResult OnWarpCommand(TextCommandCallingArgs args)
         {
             IServerPlayer player = args.Caller.Player as IServerPlayer;
@@ -195,7 +302,7 @@ namespace WarpMod
             
             if (string.IsNullOrEmpty(action))
             {
-                return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], or use /warps to list waypoints");
+            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], /back (return to previous location), or use /warps to list waypoints");
             }
 
             if (action.ToLower() == "set" && !string.IsNullOrEmpty(name))
@@ -215,7 +322,7 @@ namespace WarpMod
                 return TeleportToWarp(player, action);
             }
 
-            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], or use /warps to list waypoints");
+            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], /back (return to previous location), or use /warps to list waypoints");
         }
 
         private TextCommandResult SetWarp(IServerPlayer player, string warpName)
@@ -256,6 +363,11 @@ namespace WarpMod
 
             WarpData warpData = availableWarps[warpName];
             Vec3d warpPos = warpData.Position;
+
+            // Store current location for /back command
+            string playerUID = player.PlayerUID;
+            Vec3d currentPos = player.Entity.ServerPos.XYZ;
+            playerPreviousLocations[playerUID] = currentPos;
 
             // Teleport the player
             player.Entity.TeleportToDouble(warpPos.X, warpPos.Y, warpPos.Z);
