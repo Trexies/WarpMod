@@ -30,7 +30,7 @@ By default, waypoints are shared with group members. You can control this with:
 - **Disable sharing**: `/warp groupshare FALSE` - Your waypoints become private
 
 - Players always have access to their own waypoints regardless of sharing settings.
-- Additionally, when a players is not present in the server, their warps will not be display for their group members.
+- When a players is not present in the server, their warps will not be display for their group members.
 - If a player leaves a group, their warps leave with them.
 
 ## Permissions
