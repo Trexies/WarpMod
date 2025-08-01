@@ -28,11 +28,13 @@ namespace WarpMod
     {
         public Dictionary<string, Dictionary<string, WarpData>> PlayerWarps { get; set; }
         public Dictionary<string, bool> PlayerSharingEnabled { get; set; }
+        public Dictionary<string, bool> PlayerOfflineSharingEnabled { get; set; }
         
         public WarpModData()
         {
             PlayerWarps = new Dictionary<string, Dictionary<string, WarpData>>();
             PlayerSharingEnabled = new Dictionary<string, bool>();
+            PlayerOfflineSharingEnabled = new Dictionary<string, bool>();
         }
     }
 
@@ -41,6 +43,7 @@ namespace WarpMod
         private ICoreServerAPI serverApi;
         private Dictionary<string, Dictionary<string, WarpData>> playerWarps; // playerUID -> warpName -> warpData
         private Dictionary<string, bool> playerSharingEnabled; // playerUID -> sharing enabled/disabled
+        private Dictionary<string, bool> playerOfflineSharingEnabled; // playerUID -> offline sharing enabled/disabled
         private Dictionary<string, Vec3d> playerPreviousLocations; // playerUID -> previous location before warp
 
         public override void StartServerSide(ICoreServerAPI api)
@@ -48,6 +51,7 @@ namespace WarpMod
             serverApi = api;
             playerWarps = new Dictionary<string, Dictionary<string, WarpData>>();
             playerSharingEnabled = new Dictionary<string, bool>();
+            playerOfflineSharingEnabled = new Dictionary<string, bool>();
             playerPreviousLocations = new Dictionary<string, Vec3d>();
 
             RegisterCommands();
@@ -196,18 +200,36 @@ namespace WarpMod
         private Dictionary<string, WarpData> GetAvailableWarps(IServerPlayer player)
         {
             var pooledWarps = new Dictionary<string, WarpData>();
-            var memberUIDs = GetGroupMemberUIDs(player);
+            var onlinePlayerUIDs = serverApi.World.AllOnlinePlayers.Select(p => p.PlayerUID).ToHashSet();
             
-            // Collect warps from group members, respecting sharing preferences
-            foreach (var memberUID in memberUIDs)
+            // Get all potential group member UIDs (online group members + check all warp owners for offline sharing)
+            var groupMemberUIDs = GetGroupMemberUIDs(player);
+            
+            // Check all stored warp owners to see if any have offline sharing enabled for this player's groups
+            var allPotentialUIDs = new HashSet<string>(groupMemberUIDs);
+            
+            // Add any player UIDs that might have offline sharing enabled and are in the same groups
+            foreach (var warpOwnerUID in playerWarps.Keys)
+            {
+                if (!allPotentialUIDs.Contains(warpOwnerUID))
+                {
+                    // Check if this warp owner shares groups with current player and has offline sharing enabled
+                    if (IsInSameGroup(player, warpOwnerUID) && 
+                        playerOfflineSharingEnabled.ContainsKey(warpOwnerUID) && 
+                        playerOfflineSharingEnabled[warpOwnerUID])
+                    {
+                        allPotentialUIDs.Add(warpOwnerUID);
+                    }
+                }
+            }
+            
+            // Collect warps from all potential members, respecting sharing preferences
+            foreach (var memberUID in allPotentialUIDs)
             {
                 if (playerWarps.ContainsKey(memberUID))
                 {
-                    // Always include own warps, only include others' warps if they have sharing enabled
-                    bool includeWarps = (memberUID == player.PlayerUID) || 
-                                      (!playerSharingEnabled.ContainsKey(memberUID) || playerSharingEnabled[memberUID]);
-                    
-                    if (includeWarps)
+                    // Always include own warps
+                    if (memberUID == player.PlayerUID)
                     {
                         foreach (var warp in playerWarps[memberUID])
                         {
@@ -215,10 +237,63 @@ namespace WarpMod
                             pooledWarps[uniqueName] = warp.Value;
                         }
                     }
+                    else
+                    {
+                        // For other players' warps, check sharing settings
+                        bool hasGroupSharing = playerSharingEnabled.ContainsKey(memberUID) && playerSharingEnabled[memberUID];
+                        
+                        if (hasGroupSharing)
+                        {
+                            bool isOnline = onlinePlayerUIDs.Contains(memberUID);
+                            bool hasOfflineSharing = playerOfflineSharingEnabled.ContainsKey(memberUID) && playerOfflineSharingEnabled[memberUID];
+                            
+                            // Include warps if player is online OR has offline sharing enabled
+                            if (isOnline || hasOfflineSharing)
+                            {
+                                foreach (var warp in playerWarps[memberUID])
+                                {
+                                    string uniqueName = GetUniquePoolName(pooledWarps, warp.Key);
+                                    pooledWarps[uniqueName] = warp.Value;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             
             return pooledWarps;
+        }
+
+        private bool IsInSameGroup(IServerPlayer player, string otherPlayerUID)
+        {
+            try
+            {
+                var groups = player.GetGroups();
+                if (groups == null || groups.Length == 0) return false;
+                
+                // Get the other player's data to check their groups
+                var otherPlayer = serverApi.World.AllPlayers.FirstOrDefault(p => p.PlayerUID == otherPlayerUID);
+                if (otherPlayer == null) return false;
+                
+                var otherGroups = otherPlayer.GetGroups();
+                if (otherGroups == null || otherGroups.Length == 0) return false;
+                
+                // Check if they share any group
+                foreach (var group1 in groups)
+                {
+                    foreach (var group2 in otherGroups)
+                    {
+                        if (group1.GroupUid == group2.GroupUid)
+                            return true;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                serverApi.Logger.Error($"Error checking group membership: {e.Message}");
+            }
+            
+            return false;
         }
 
         private string GetUniquePoolName(Dictionary<string, WarpData> existingWarps, string baseName)
@@ -302,7 +377,7 @@ namespace WarpMod
             
             if (string.IsNullOrEmpty(action))
             {
-            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], /back (return to previous location), or use /warps to list waypoints");
+            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], /warp shareoffline [TRUE|FALSE], /back (return to previous location), or use /warps to list waypoints");
             }
 
             if (action.ToLower() == "set" && !string.IsNullOrEmpty(name))
@@ -317,12 +392,16 @@ namespace WarpMod
             {
                 return SetGroupShare(player, name);
             }
+            else if (action.ToLower() == "shareoffline" && !string.IsNullOrEmpty(name))
+            {
+                return SetOfflineShare(player, name);
+            }
             else if (!string.IsNullOrEmpty(action) && string.IsNullOrEmpty(name))
             {
                 return TeleportToWarp(player, action);
             }
 
-            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], /back (return to previous location), or use /warps to list waypoints");
+            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], /warp shareoffline [TRUE|FALSE], /back (return to previous location), or use /warps to list waypoints");
         }
 
         private TextCommandResult SetWarp(IServerPlayer player, string warpName)
@@ -444,6 +523,45 @@ namespace WarpMod
             return TextCommandResult.Success(message);
         }
 
+        private TextCommandResult SetOfflineShare(IServerPlayer player, string value)
+        {
+            string playerUID = player.PlayerUID;
+
+            if (string.IsNullOrEmpty(value))
+            {
+                return TextCommandResult.Error("Usage: /warp shareoffline [TRUE|FALSE]");
+            }
+
+            // Check if player has group sharing enabled first
+            if (!playerSharingEnabled.ContainsKey(playerUID) || !playerSharingEnabled[playerUID])
+            {
+                return TextCommandResult.Error("You must enable group sharing first with '/warp groupshare TRUE' before enabling offline sharing.");
+            }
+
+            bool enableOfflineSharing;
+            if (value.ToUpper() == "TRUE")
+            {
+                enableOfflineSharing = true;
+            }
+            else if (value.ToUpper() == "FALSE")
+            {
+                enableOfflineSharing = false;
+            }
+            else
+            {
+                return TextCommandResult.Error("Usage: /warp shareoffline [TRUE|FALSE]");
+            }
+
+            playerOfflineSharingEnabled[playerUID] = enableOfflineSharing;
+            SaveWarpData();
+
+            string message = enableOfflineSharing 
+                ? "Offline waypoint sharing enabled. Group members can use your waypoints even when you're offline."
+                : "Offline waypoint sharing disabled. Group members can only use your waypoints when you're online.";
+
+            return TextCommandResult.Success(message);
+        }
+
         private void LoadWarpData()
         {
             try
@@ -465,6 +583,7 @@ namespace WarpMod
                         {
                             playerWarps = loadedWarpModData.PlayerWarps ?? new Dictionary<string, Dictionary<string, WarpData>>();
                             playerSharingEnabled = loadedWarpModData.PlayerSharingEnabled ?? new Dictionary<string, bool>();
+                            playerOfflineSharingEnabled = loadedWarpModData.PlayerOfflineSharingEnabled ?? new Dictionary<string, bool>();
                             serverApi.Logger.Debug("Loaded world-specific warp data successfully");
                             return;
                         }
@@ -561,7 +680,8 @@ namespace WarpMod
                 var warpModData = new WarpModData
                 {
                     PlayerWarps = playerWarps,
-                    PlayerSharingEnabled = playerSharingEnabled
+                    PlayerSharingEnabled = playerSharingEnabled,
+                    PlayerOfflineSharingEnabled = playerOfflineSharingEnabled
                 };
 
                 // Save to world-specific storage using world data APIs

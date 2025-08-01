@@ -2,7 +2,7 @@
   "type": "code",
   "name": "WarpMod",
   "modid": "warpmod",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Allows players to set and teleport to warp points",
   "authors": ["Trexies"],
   "dependencies": {
