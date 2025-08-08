@@ -107,28 +107,41 @@ namespace WarpMod
 
                     Vec3d lastPos = playerLastKnownPositions[playerUID];
                     long lastUpdate = playerLastPositionUpdate[playerUID];
-                    double timeDiff = currentTime - lastUpdate;
-
+                    
                     // Calculate distance moved
                     double distance = currentPos.DistanceTo(lastPos);
 
-                    // Detect teleportation: significant distance (>15 blocks) in short time (<500ms)
-                    // This filters out normal movement but catches teleports
-                    if (distance > 15.0 && timeDiff < 500)
+                    // Only process if player has actually moved (minimum 0.1 blocks to avoid floating point precision issues)
+                    if (distance > 0.1)
                     {
-                        // Check if this wasn't a /back command (avoid storing position during /back)
-                        if (!playerPreviousLocations.ContainsKey(playerUID) || 
-                            playerPreviousLocations[playerUID].DistanceTo(currentPos) > 5.0)
+                        double timeDiff = currentTime - lastUpdate;
+                        
+                        // Detect teleportation: significant distance (>15 blocks) in short time (<1000ms)
+                        // Increased time threshold to be more forgiving of lag
+                        if (distance > 15.0 && timeDiff < 1000)
                         {
-                            // Store the previous position for /back
-                            playerPreviousLocations[playerUID] = lastPos;
-                            serverApi.Logger.Debug($"Detected teleportation for {player.PlayerName}: {(int)lastPos.X}, {(int)lastPos.Y}, {(int)lastPos.Z} -> {(int)currentPos.X}, {(int)currentPos.Y}, {(int)currentPos.Z}");
+                            // Additional check: ensure this is actually a teleport by checking movement speed
+                            // Normal running speed in VS is about 4-6 blocks/second, so >15 blocks/second is definitely a teleport
+                            double speed = distance / (timeDiff / 1000.0); // blocks per second
+                            
+                            if (speed > 15.0)
+                            {
+                                // Check if this wasn't a /back command (avoid storing position during /back)
+                                if (!playerPreviousLocations.ContainsKey(playerUID) || 
+                                    playerPreviousLocations[playerUID].DistanceTo(currentPos) > 5.0)
+                                {
+                                    // Store the previous position for /back
+                                    playerPreviousLocations[playerUID] = lastPos;
+                                    serverApi.Logger.Debug($"Detected teleportation for {player.PlayerName}: {(int)lastPos.X}, {(int)lastPos.Y}, {(int)lastPos.Z} -> {(int)currentPos.X}, {(int)currentPos.Y}, {(int)currentPos.Z} (speed: {speed:F1} blocks/s)");
+                                }
+                            }
                         }
+                        
+                        // Only update tracking data when player has actually moved
+                        playerLastKnownPositions[playerUID] = currentPos;
+                        playerLastPositionUpdate[playerUID] = currentTime;
                     }
-
-                    // Update tracking data
-                    playerLastKnownPositions[playerUID] = currentPos;
-                    playerLastPositionUpdate[playerUID] = currentTime;
+                    // If player hasn't moved, don't update anything - this preserves the last movement timestamp
                 }
             }
             catch (Exception e)
