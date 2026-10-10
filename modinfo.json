@@ -2,11 +2,11 @@
   "type": "code",
   "name": "WarpMod",
   "modid": "warpmod",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Allows players to set, share, and teleport to warp points, with a /back command. Warps are stored per-world.",
   "authors": ["Trexies"],
   "side": "Server",
   "dependencies": {
-    "game": "1.22.7"
+    "game": "1.22.0"
   }
 }
