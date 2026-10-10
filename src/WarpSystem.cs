@@ -1,9 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using Vintagestory.API.Common;
-using Vintagestory.API.Server;
 using Vintagestory.API.MathTools;
+using Vintagestory.API.Server;
 
 namespace WarpMod
 {
@@ -12,269 +13,414 @@ namespace WarpMod
         public Vec3d Position { get; set; }
         public string OwnerName { get; set; }
         public string OwnerUID { get; set; }
-        
+
         public WarpData(Vec3d position, string ownerName, string ownerUID)
         {
             Position = position;
             OwnerName = ownerName;
             OwnerUID = ownerUID;
         }
-        
-        // Parameterless constructor for JSON deserialization
+
+        // Required for JSON deserialization.
         public WarpData() { }
     }
 
+    // Everything persisted per-world, serialized as a single JSON blob.
     public class WarpModData
     {
-        public Dictionary<string, Dictionary<string, WarpData>> PlayerWarps { get; set; }
-        public Dictionary<string, bool> PlayerSharingEnabled { get; set; }
-        public Dictionary<string, bool> PlayerOfflineSharingEnabled { get; set; }
-        
-        public WarpModData()
-        {
-            PlayerWarps = new Dictionary<string, Dictionary<string, WarpData>>();
-            PlayerSharingEnabled = new Dictionary<string, bool>();
-            PlayerOfflineSharingEnabled = new Dictionary<string, bool>();
-        }
+        public Dictionary<string, Dictionary<string, WarpData>> PlayerWarps { get; set; } = new();
+        public Dictionary<string, bool> PlayerSharingEnabled { get; set; } = new();
+        public Dictionary<string, bool> PlayerOfflineSharingEnabled { get; set; } = new();
     }
 
     public class WarpSystemMod : ModSystem
     {
-        private ICoreServerAPI serverApi;
-        private Dictionary<string, Dictionary<string, WarpData>> playerWarps; // playerUID -> warpName -> warpData
-        private Dictionary<string, bool> playerSharingEnabled; // playerUID -> sharing enabled/disabled
-        private Dictionary<string, bool> playerOfflineSharingEnabled; // playerUID -> offline sharing enabled/disabled
-        private Dictionary<string, Vec3d> playerPreviousLocations; // playerUID -> previous location before warp
+        // Savegame data key (stored INSIDE the .vcdbs, so it's inherently per-world).
+        private const string SaveKey = "warpmod_data";
+
+        private ICoreServerAPI sapi;
+
+        // Persisted state.
+        private Dictionary<string, Dictionary<string, WarpData>> playerWarps = new();          // uid -> name -> warp
+        private Dictionary<string, bool> playerSharingEnabled = new();                          // uid -> group sharing
+        private Dictionary<string, bool> playerOfflineSharingEnabled = new();                   // uid -> offline sharing
+
+        // Session-only state (not persisted).
+        private readonly Dictionary<string, Vec3d> playerPreviousLocations = new();             // uid -> /back target
+        private readonly Dictionary<string, Vec3d> playerLastKnownPositions = new();            // teleport detection
+        private readonly Dictionary<string, long> playerLastPositionUpdate = new();
 
         public override void StartServerSide(ICoreServerAPI api)
         {
-            serverApi = api;
-            playerWarps = new Dictionary<string, Dictionary<string, WarpData>>();
-            playerSharingEnabled = new Dictionary<string, bool>();
-            playerOfflineSharingEnabled = new Dictionary<string, bool>();
-            playerPreviousLocations = new Dictionary<string, Vec3d>();
+            sapi = api;
 
             RegisterCommands();
-            LoadWarpData();
 
-            // Save data when server shuts down or world is saved
-            serverApi.Event.SaveGameLoaded += () => LoadWarpData();
-            serverApi.Event.GameWorldSave += () => SaveWarpData();
+            // Load only once the savegame is actually available; persist on each world save.
+            sapi.Event.SaveGameLoaded += LoadWarpData;
+            sapi.Event.GameWorldSave += SaveWarpData;
+            sapi.Event.PlayerDisconnect += OnPlayerDisconnect;
 
-            // Start universal teleport tracking system
-            StartTeleportTracking();
+            // Detect teleports from any source (other mods, /tp, etc.) so /back works everywhere.
+            sapi.Event.RegisterGameTickListener(_ => CheckForTeleportations(), 200);
+            sapi.Logger.Notification("[warpmod] Teleport tracking started.");
         }
 
-        private Dictionary<string, Vec3d> playerLastKnownPositions; // Track last known positions for teleport detection
-        private Dictionary<string, long> playerLastPositionUpdate; // Track when position was last updated
+        #region Commands
 
-        private void StartTeleportTracking()
+        private void RegisterCommands()
         {
-            playerLastKnownPositions = new Dictionary<string, Vec3d>();
-            playerLastPositionUpdate = new Dictionary<string, long>();
+            var parsers = sapi.ChatCommands.Parsers;
 
-            // Start a repeating timer to check for teleportation every 200ms
-            serverApi.Event.RegisterGameTickListener((dt) =>
-            {
-                CheckForTeleportations();
-            }, 200);
+            sapi.ChatCommands.Create("warp")
+                .WithDescription("Set, delete, share, or teleport to warps.")
+                .RequiresPlayer()
+                .RequiresPrivilege(Privilege.tp)
+                .WithArgs(parsers.OptionalWord("action"), parsers.OptionalWord("name"))
+                .HandleWith(OnWarpCommand);
 
-            serverApi.Logger.Debug("Universal teleport tracking system started");
+            sapi.ChatCommands.Create("warps")
+                .WithDescription("List all warps available to you.")
+                .RequiresPlayer()
+                .RequiresPrivilege(Privilege.tp)
+                .HandleWith(OnWarpsCommand);
+
+            sapi.ChatCommands.Create("back")
+                .WithDescription("Teleport back to your location before the last teleport.")
+                .RequiresPlayer()
+                .RequiresPrivilege(Privilege.tp)
+                .HandleWith(OnBackCommand);
+
+            // Import the legacy GLOBAL warp config into THIS world on demand (console-runnable).
+            sapi.ChatCommands.Create("warpimport")
+                .WithDescription("Import legacy global warp data into the current world (one-time).")
+                .RequiresPrivilege(Privilege.controlserver)
+                .HandleWith(OnWarpImportCommand);
         }
+
+        private TextCommandResult OnWarpImportCommand(TextCommandCallingArgs args)
+        {
+            string who = args.Caller.Player?.PlayerName ?? "Console";
+
+            // Only import into a world that has no warps yet, so this can never mix or re-seed data.
+            if (playerWarps.Count > 0)
+            {
+                return TextCommandResult.Error("This world already has warps; import skipped to avoid mixing data.");
+            }
+
+            if (!MigrateLegacyGlobalConfig())
+            {
+                return TextCommandResult.Error("No legacy global warp config found to import.");
+            }
+
+            sapi.Logger.Notification($"[warpmod] {who} imported legacy global warps into this world ({playerWarps.Count} player(s)).");
+            return TextCommandResult.Success($"Imported legacy warps into THIS world ({playerWarps.Count} player(s)).");
+        }
+
+        private TextCommandResult OnWarpCommand(TextCommandCallingArgs args)
+        {
+            if (args.Caller.Player is not IServerPlayer player)
+                return TextCommandResult.Error("This command can only be used by players.");
+
+            string action = (args.Parsers[0].GetValue() as string)?.Trim();
+            string name = (args.Parsers[1].GetValue() as string)?.Trim();
+
+            if (string.IsNullOrEmpty(action))
+                return Usage();
+
+            switch (action.ToLowerInvariant())
+            {
+                case "set":          return RequireName(name) ?? SetWarp(player, name);
+                case "delete":
+                case "remove":       return RequireName(name) ?? DeleteWarp(player, name);
+                case "groupshare":   return RequireName(name) ?? SetGroupShare(player, name);
+                case "shareoffline": return RequireName(name) ?? SetOfflineShare(player, name);
+
+                default:
+                    // No recognized subcommand => treat the first word as a warp to teleport to.
+                    return string.IsNullOrEmpty(name) ? TeleportToWarp(player, action) : Usage();
+            }
+        }
+
+        private TextCommandResult OnWarpsCommand(TextCommandCallingArgs args)
+        {
+            if (args.Caller.Player is not IServerPlayer player)
+                return TextCommandResult.Error("This command can only be used by players.");
+
+            return ListWarps(player);
+        }
+
+        private TextCommandResult OnBackCommand(TextCommandCallingArgs args)
+        {
+            if (args.Caller.Player is not IServerPlayer player)
+                return TextCommandResult.Error("This command can only be used by players.");
+
+            string uid = player.PlayerUID;
+            if (!playerPreviousLocations.TryGetValue(uid, out var prev))
+                return TextCommandResult.Error("No previous location stored. Teleport somewhere first.");
+
+            player.Entity.TeleportToDouble(prev.X, prev.Y, prev.Z);
+            playerPreviousLocations.Remove(uid); // one /back per teleport
+
+            return TextCommandResult.Success($"Teleported back to {(int)prev.X}, {(int)prev.Y}, {(int)prev.Z}.");
+        }
+
+        private static TextCommandResult RequireName(string name) =>
+            string.IsNullOrEmpty(name) ? Usage() : null;
+
+        // NOTE: command results are rendered as VTML, so a literal '<' starts a tag.
+        // Writing "<name>" makes the parser treat it as an unclosed tag, which eats the
+        // rest of the message AND breaks rendering of the messages after it. Escape as
+        // &lt;/&gt; (same convention Vintage Story's own lang files use).
+        private static TextCommandResult Usage() => TextCommandResult.Error(
+            "Usage: /warp &lt;name&gt; | /warp set &lt;name&gt; | /warp delete &lt;name&gt; | " +
+            "/warp groupshare &lt;true|false&gt; | /warp shareoffline &lt;true|false&gt; | /warps | /back");
+
+        #endregion
+
+        #region Warp operations
+
+        private TextCommandResult SetWarp(IServerPlayer player, string warpName)
+        {
+            string uid = player.PlayerUID;
+
+            // Entity.ServerPos was removed in 1.22; Entity.Pos is the replacement.
+            Vec3d pos = player.Entity.Pos.XYZ;
+
+            if (!playerWarps.TryGetValue(uid, out var warps))
+            {
+                warps = new Dictionary<string, WarpData>();
+                playerWarps[uid] = warps;
+            }
+
+            string uniqueName = MakeUnique(warpName, warps.ContainsKey);
+            warps[uniqueName] = new WarpData(pos, player.PlayerName, uid);
+
+            SaveWarpData();
+
+            string suffix = uniqueName == warpName ? "" : " (renamed due to a name conflict)";
+            return TextCommandResult.Success(
+                $"Warp '{uniqueName}' set at {(int)pos.X}, {(int)pos.Y}, {(int)pos.Z}{suffix}.");
+        }
+
+        private TextCommandResult TeleportToWarp(IServerPlayer player, string warpName)
+        {
+            var available = GetAvailableWarps(player);
+            if (!available.TryGetValue(warpName, out var warp))
+                return TextCommandResult.Error($"Warp '{warpName}' not found. Use /warps to see what's available.");
+
+            // Remember where we were so /back works even though the jump is instant.
+            playerPreviousLocations[player.PlayerUID] = player.Entity.Pos.XYZ;
+
+            Vec3d p = warp.Position;
+            player.Entity.TeleportToDouble(p.X, p.Y, p.Z);
+
+            return TextCommandResult.Success($"Teleported to '{warpName}' (set by {warp.OwnerName}).");
+        }
+
+        private TextCommandResult DeleteWarp(IServerPlayer player, string warpName)
+        {
+            string uid = player.PlayerUID;
+
+            // Players can only delete their OWN warps, by the real (unpooled) name.
+            if (!playerWarps.TryGetValue(uid, out var warps) || !warps.Remove(warpName))
+                return TextCommandResult.Error($"You don't have a warp named '{warpName}'.");
+
+            if (warps.Count == 0) playerWarps.Remove(uid); // prune empty buckets
+            SaveWarpData();
+
+            return TextCommandResult.Success($"Warp '{warpName}' deleted.");
+        }
+
+        private TextCommandResult ListWarps(IServerPlayer player)
+        {
+            var available = GetAvailableWarps(player);
+            if (available.Count == 0)
+                return TextCommandResult.Success("No warps available. Set one with /warp set &lt;name&gt;.");
+
+            var sb = new StringBuilder("Available warps:\n");
+            foreach (var kvp in available.OrderBy(w => w.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                Vec3d p = kvp.Value.Position;
+                sb.Append($"- {kvp.Key} ({kvp.Value.OwnerName}): {(int)p.X}, {(int)p.Y}, {(int)p.Z}\n");
+            }
+
+            return TextCommandResult.Success(sb.ToString());
+        }
+
+        private TextCommandResult SetGroupShare(IServerPlayer player, string value)
+        {
+            if (!TryParseToggle(value, out bool enable))
+                return TextCommandResult.Error("Usage: /warp groupshare &lt;true|false&gt;");
+
+            string uid = player.PlayerUID;
+            playerSharingEnabled[uid] = enable;
+            if (!enable) playerOfflineSharingEnabled[uid] = false; // offline sharing requires group sharing
+            SaveWarpData();
+
+            return TextCommandResult.Success(enable
+                ? "Group sharing enabled - group members can use your warps while you're online."
+                : "Group sharing disabled - your warps are now private.");
+        }
+
+        private TextCommandResult SetOfflineShare(IServerPlayer player, string value)
+        {
+            string uid = player.PlayerUID;
+
+            if (!TryParseToggle(value, out bool enable))
+                return TextCommandResult.Error("Usage: /warp shareoffline &lt;true|false&gt;");
+
+            if (enable && !(playerSharingEnabled.TryGetValue(uid, out bool gs) && gs))
+                return TextCommandResult.Error("Enable group sharing first: /warp groupshare true");
+
+            playerOfflineSharingEnabled[uid] = enable;
+            SaveWarpData();
+
+            return TextCommandResult.Success(enable
+                ? "Offline sharing enabled - group members can use your warps even while you're offline."
+                : "Offline sharing disabled - your warps are only available while you're online.");
+        }
+
+        #endregion
+
+        #region Teleport tracking (powers /back)
 
         private void CheckForTeleportations()
         {
             try
             {
-                var onlinePlayers = serverApi.World.AllOnlinePlayers;
-                if (onlinePlayers == null) return;
+                var players = sapi.World.AllOnlinePlayers;
+                if (players == null) return;
 
-                foreach (IServerPlayer player in onlinePlayers)
+                long now = sapi.World.ElapsedMilliseconds;
+
+                foreach (IServerPlayer player in players)
                 {
-                    if (player?.Entity?.ServerPos == null) continue;
+                    if (player?.Entity?.Pos == null) continue;
 
-                    string playerUID = player.PlayerUID;
-                    Vec3d currentPos = player.Entity.ServerPos.XYZ;
-                    long currentTime = serverApi.World.ElapsedMilliseconds;
+                    string uid = player.PlayerUID;
+                    Vec3d currentPos = player.Entity.Pos.XYZ;
 
-                    // Skip if player just joined or respawned
-                    if (!playerLastKnownPositions.ContainsKey(playerUID))
+                    if (!playerLastKnownPositions.TryGetValue(uid, out var lastPos))
                     {
-                        playerLastKnownPositions[playerUID] = currentPos;
-                        playerLastPositionUpdate[playerUID] = currentTime;
+                        playerLastKnownPositions[uid] = currentPos;
+                        playerLastPositionUpdate[uid] = now;
                         continue;
                     }
 
-                    Vec3d lastPos = playerLastKnownPositions[playerUID];
-                    long lastUpdate = playerLastPositionUpdate[playerUID];
-                    
-                    // Calculate distance moved
                     double distance = currentPos.DistanceTo(lastPos);
+                    if (distance <= 0.1) continue; // hasn't meaningfully moved
 
-                    // Only process if player has actually moved (minimum 0.1 blocks to avoid floating point precision issues)
-                    if (distance > 0.1)
+                    double timeDiff = now - playerLastPositionUpdate[uid];
+
+                    // Teleport heuristic: a large jump in a short window, faster than running (~4-6 b/s).
+                    if (distance > 15.0 && timeDiff > 0 && timeDiff < 1000)
                     {
-                        double timeDiff = currentTime - lastUpdate;
-                        
-                        // Detect teleportation: significant distance (>15 blocks) in short time (<1000ms)
-                        // Increased time threshold to be more forgiving of lag
-                        if (distance > 15.0 && timeDiff < 1000)
+                        double speed = distance / (timeDiff / 1000.0); // blocks per second
+                        if (speed > 15.0)
                         {
-                            // Additional check: ensure this is actually a teleport by checking movement speed
-                            // Normal running speed in VS is about 4-6 blocks/second, so >15 blocks/second is definitely a teleport
-                            double speed = distance / (timeDiff / 1000.0); // blocks per second
-                            
-                            if (speed > 15.0)
+                            // Don't clobber a /back target we just set for roughly this same spot.
+                            if (!playerPreviousLocations.TryGetValue(uid, out var prev) || prev.DistanceTo(currentPos) > 5.0)
                             {
-                                // Check if this wasn't a /back command (avoid storing position during /back)
-                                if (!playerPreviousLocations.ContainsKey(playerUID) || 
-                                    playerPreviousLocations[playerUID].DistanceTo(currentPos) > 5.0)
-                                {
-                                    // Store the previous position for /back
-                                    playerPreviousLocations[playerUID] = lastPos;
-                                    serverApi.Logger.Debug($"Detected teleportation for {player.PlayerName}: {(int)lastPos.X}, {(int)lastPos.Y}, {(int)lastPos.Z} -> {(int)currentPos.X}, {(int)currentPos.Y}, {(int)currentPos.Z} (speed: {speed:F1} blocks/s)");
-                                }
+                                playerPreviousLocations[uid] = lastPos;
+                                sapi.Logger.Debug(
+                                    $"[warpmod] Teleport detected for {player.PlayerName}: " +
+                                    $"{(int)lastPos.X},{(int)lastPos.Y},{(int)lastPos.Z} -> " +
+                                    $"{(int)currentPos.X},{(int)currentPos.Y},{(int)currentPos.Z} ({speed:F1} b/s)");
                             }
                         }
-                        
-                        // Only update tracking data when player has actually moved
-                        playerLastKnownPositions[playerUID] = currentPos;
-                        playerLastPositionUpdate[playerUID] = currentTime;
                     }
-                    // If player hasn't moved, don't update anything - this preserves the last movement timestamp
+
+                    playerLastKnownPositions[uid] = currentPos;
+                    playerLastPositionUpdate[uid] = now;
                 }
             }
             catch (Exception e)
             {
-                serverApi.Logger.Error($"Error in teleport tracking: {e.Message}");
+                sapi.Logger.Error("[warpmod] Error in teleport tracking: " + e);
             }
         }
 
-        private void RegisterCommands()
+        private void OnPlayerDisconnect(IServerPlayer player)
         {
-            serverApi.ChatCommands.Create("warp")
-                .WithDescription("Teleport to a warp point or set a new one")
-                .RequiresPlayer()
-                .RequiresPrivilege(Privilege.tp) // Optional: require teleport privilege
-                .WithArgs(serverApi.ChatCommands.Parsers.OptionalWord("action"), serverApi.ChatCommands.Parsers.OptionalWord("name"), serverApi.ChatCommands.Parsers.OptionalWord("value"))
-                .HandleWith(OnWarpCommand);
+            // Keep session dictionaries from growing without bound.
+            string uid = player.PlayerUID;
+            playerLastKnownPositions.Remove(uid);
+            playerLastPositionUpdate.Remove(uid);
+            playerPreviousLocations.Remove(uid);
+        }
 
-            serverApi.ChatCommands.Create("warps")
-                .WithDescription("List all available waypoints")
-                .RequiresPlayer()
-                .RequiresPrivilege(Privilege.tp)
-                .HandleWith(OnWarpsCommand);
+        #endregion
 
-            serverApi.ChatCommands.Create("back")
-                .WithDescription("Teleport back to your location prior to the last teleportation")
-                .RequiresPlayer()
-                .RequiresPrivilege(Privilege.tp)
-                .HandleWith(OnBackCommand);
+        #region Group pooling / sharing
+
+        // Warps visible to a player: their own, plus group members' warps subject to sharing settings.
+        private Dictionary<string, WarpData> GetAvailableWarps(IServerPlayer player)
+        {
+            var pooled = new Dictionary<string, WarpData>();
+            var onlineUIDs = sapi.World.AllOnlinePlayers.Select(p => p.PlayerUID).ToHashSet();
+
+            var candidateUIDs = new HashSet<string>(GetGroupMemberUIDs(player));
+
+            // Also include offline owners who share a group with us AND have offline sharing on.
+            foreach (var ownerUID in playerWarps.Keys)
+            {
+                if (candidateUIDs.Contains(ownerUID)) continue;
+                if (IsInSameGroup(player, ownerUID)
+                    && playerOfflineSharingEnabled.TryGetValue(ownerUID, out bool off) && off)
+                {
+                    candidateUIDs.Add(ownerUID);
+                }
+            }
+
+            foreach (var uid in candidateUIDs)
+            {
+                if (!playerWarps.TryGetValue(uid, out var warps)) continue;
+
+                bool isSelf = uid == player.PlayerUID;
+                if (!isSelf)
+                {
+                    bool groupShare = playerSharingEnabled.TryGetValue(uid, out bool gs) && gs;
+                    if (!groupShare) continue;
+
+                    bool online = onlineUIDs.Contains(uid);
+                    bool offlineShare = playerOfflineSharingEnabled.TryGetValue(uid, out bool os) && os;
+                    if (!online && !offlineShare) continue;
+                }
+
+                foreach (var warp in warps)
+                    pooled[MakeUnique(warp.Key, pooled.ContainsKey)] = warp.Value;
+            }
+
+            return pooled;
         }
 
         private List<string> GetGroupMemberUIDs(IServerPlayer player)
         {
-            var memberUIDs = new List<string> { player.PlayerUID }; // Always include self
-            
+            var memberUIDs = new List<string> { player.PlayerUID }; // always include self
+
             try
             {
                 var groups = player.GetGroups();
-                if (groups != null && groups.Length > 0)
+                if (groups == null) return memberUIDs;
+
+                foreach (var membership in groups)
                 {
-                    // For each group the player is in, get all members from the group manager
-                    foreach (var groupMembership in groups)
-                    {
-                        // Try to get the full group from the group manager
-                        if (serverApi.Groups.PlayerGroupsById.ContainsKey(groupMembership.GroupUid))
-                        {
-                            var fullGroup = serverApi.Groups.PlayerGroupsById[groupMembership.GroupUid];
-                            if (fullGroup != null)
-                            {
-                                // Add all online players from this group
-                                foreach (var member in fullGroup.OnlinePlayers)
-                                {
-                                    if (!memberUIDs.Contains(member.PlayerUID))
-                                        memberUIDs.Add(member.PlayerUID);
-                                }
-                            }
-                        }
-                    }
+                    if (!sapi.Groups.PlayerGroupsById.TryGetValue(membership.GroupUid, out var fullGroup) || fullGroup == null)
+                        continue;
+
+                    foreach (var member in fullGroup.OnlinePlayers)
+                        if (!memberUIDs.Contains(member.PlayerUID))
+                            memberUIDs.Add(member.PlayerUID);
                 }
             }
             catch (Exception e)
             {
-                serverApi.Logger.Error($"Error getting group members for player {player.PlayerName}: {e.Message}");
-                // Fall back to just the player themselves
+                sapi.Logger.Error($"[warpmod] Error resolving group members for {player.PlayerName}: {e.Message}");
+                // Fall back to just the player themselves.
             }
-            
-            return memberUIDs;
-        }
 
-        private Dictionary<string, WarpData> GetAvailableWarps(IServerPlayer player)
-        {
-            var pooledWarps = new Dictionary<string, WarpData>();
-            var onlinePlayerUIDs = serverApi.World.AllOnlinePlayers.Select(p => p.PlayerUID).ToHashSet();
-            
-            // Get all potential group member UIDs (online group members + check all warp owners for offline sharing)
-            var groupMemberUIDs = GetGroupMemberUIDs(player);
-            
-            // Check all stored warp owners to see if any have offline sharing enabled for this player's groups
-            var allPotentialUIDs = new HashSet<string>(groupMemberUIDs);
-            
-            // Add any player UIDs that might have offline sharing enabled and are in the same groups
-            foreach (var warpOwnerUID in playerWarps.Keys)
-            {
-                if (!allPotentialUIDs.Contains(warpOwnerUID))
-                {
-                    // Check if this warp owner shares groups with current player and has offline sharing enabled
-                    if (IsInSameGroup(player, warpOwnerUID) && 
-                        playerOfflineSharingEnabled.ContainsKey(warpOwnerUID) && 
-                        playerOfflineSharingEnabled[warpOwnerUID])
-                    {
-                        allPotentialUIDs.Add(warpOwnerUID);
-                    }
-                }
-            }
-            
-            // Collect warps from all potential members, respecting sharing preferences
-            foreach (var memberUID in allPotentialUIDs)
-            {
-                if (playerWarps.ContainsKey(memberUID))
-                {
-                    // Always include own warps
-                    if (memberUID == player.PlayerUID)
-                    {
-                        foreach (var warp in playerWarps[memberUID])
-                        {
-                            string uniqueName = GetUniquePoolName(pooledWarps, warp.Key);
-                            pooledWarps[uniqueName] = warp.Value;
-                        }
-                    }
-                    else
-                    {
-                        // For other players' warps, check sharing settings
-                        bool hasGroupSharing = playerSharingEnabled.ContainsKey(memberUID) && playerSharingEnabled[memberUID];
-                        
-                        if (hasGroupSharing)
-                        {
-                            bool isOnline = onlinePlayerUIDs.Contains(memberUID);
-                            bool hasOfflineSharing = playerOfflineSharingEnabled.ContainsKey(memberUID) && playerOfflineSharingEnabled[memberUID];
-                            
-                            // Include warps if player is online OR has offline sharing enabled
-                            if (isOnline || hasOfflineSharing)
-                            {
-                                foreach (var warp in playerWarps[memberUID])
-                                {
-                                    string uniqueName = GetUniquePoolName(pooledWarps, warp.Key);
-                                    pooledWarps[uniqueName] = warp.Value;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            return pooledWarps;
+            return memberUIDs;
         }
 
         private bool IsInSameGroup(IServerPlayer player, string otherPlayerUID)
@@ -283,406 +429,54 @@ namespace WarpMod
             {
                 var groups = player.GetGroups();
                 if (groups == null || groups.Length == 0) return false;
-                
-                // Get the other player's data to check their groups
-                var otherPlayer = serverApi.World.AllPlayers.FirstOrDefault(p => p.PlayerUID == otherPlayerUID);
-                if (otherPlayer == null) return false;
-                
-                var otherGroups = otherPlayer.GetGroups();
-                if (otherGroups == null || otherGroups.Length == 0) return false;
-                
-                // Check if they share any group
-                foreach (var group1 in groups)
-                {
-                    foreach (var group2 in otherGroups)
-                    {
-                        if (group1.GroupUid == group2.GroupUid)
-                            return true;
-                    }
-                }
+
+                // Resolve the other player's groups from their PLAYER DATA, which exists for
+                // OFFLINE players too. (sapi.World.AllPlayers only holds players who connected
+                // since the server started, so using it made offline-shared warps disappear
+                // after a server restart until that player logged in once.)
+                var otherData = sapi.PlayerData.GetPlayerDataByUid(otherPlayerUID);
+                var otherGroups = otherData?.PlayerGroupMemberships;
+                if (otherGroups == null || otherGroups.Count == 0) return false;
+
+                return groups.Any(g => otherGroups.ContainsKey(g.GroupUid));
             }
             catch (Exception e)
             {
-                serverApi.Logger.Error($"Error checking group membership: {e.Message}");
+                sapi.Logger.Error("[warpmod] Error checking group membership: " + e.Message);
+                return false;
             }
-            
-            return false;
         }
 
-        private string GetUniquePoolName(Dictionary<string, WarpData> existingWarps, string baseName)
-        {
-            if (!existingWarps.ContainsKey(baseName))
-                return baseName;
-                
-            int counter = 1;
-            string uniqueName;
-            do 
-            {
-                uniqueName = $"{baseName}({counter})";
-                counter++;
-            } while (existingWarps.ContainsKey(uniqueName));
-            
-            return uniqueName;
-        }
+        #endregion
 
-        private string GetUniquePlayerWarpName(string playerUID, string baseName)
-        {
-            if (!playerWarps.ContainsKey(playerUID))
-                return baseName;
-
-            var playerWarpDict = playerWarps[playerUID];
-            if (!playerWarpDict.ContainsKey(baseName))
-                return baseName;
-
-            // Find next available name with increment
-            int counter = 1;
-            string uniqueName;
-            do
-            {
-                uniqueName = $"{baseName}({counter})";
-                counter++;
-            } while (playerWarpDict.ContainsKey(uniqueName));
-
-            return uniqueName;
-        }
-
-        private TextCommandResult OnWarpsCommand(TextCommandCallingArgs args)
-        {
-            IServerPlayer player = args.Caller.Player as IServerPlayer;
-            if (player == null) return TextCommandResult.Error("Command can only be used by players");
-
-            return ListWarps(player);
-        }
-
-        private TextCommandResult OnBackCommand(TextCommandCallingArgs args)
-        {
-            IServerPlayer player = args.Caller.Player as IServerPlayer;
-            if (player == null) return TextCommandResult.Error("Command can only be used by players");
-
-            string playerUID = player.PlayerUID;
-
-            // Check if player has a previous location stored
-            if (!playerPreviousLocations.ContainsKey(playerUID))
-            {
-                return TextCommandResult.Error("No previous location available. Use any teleport command first.");
-            }
-
-            Vec3d previousPos = playerPreviousLocations[playerUID];
-
-            // Teleport the player to their previous location
-            player.Entity.TeleportToDouble(previousPos.X, previousPos.Y, previousPos.Z);
-
-            // Clear the previous location so /back can only be used once per warp
-            playerPreviousLocations.Remove(playerUID);
-
-            return TextCommandResult.Success($"Teleported back to your previous location: {(int)previousPos.X}, {(int)previousPos.Y}, {(int)previousPos.Z}");
-        }
-
-        private TextCommandResult OnWarpCommand(TextCommandCallingArgs args)
-        {
-            IServerPlayer player = args.Caller.Player as IServerPlayer;
-            if (player == null) return TextCommandResult.Error("Command can only be used by players");
-
-            // Parse arguments using Vintage Story's argument system
-            string action = (string)args.Parsers[0].GetValue();
-            string name = (string)args.Parsers[1].GetValue();
-            string value = (string)args.Parsers[2].GetValue();
-            
-            if (string.IsNullOrEmpty(action))
-            {
-            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], /warp shareoffline [TRUE|FALSE], /back (return to previous location), or use /warps to list waypoints");
-            }
-
-            if (action.ToLower() == "set" && !string.IsNullOrEmpty(name))
-            {
-                return SetWarp(player, name);
-            }
-            else if (action.ToLower() == "delete" && !string.IsNullOrEmpty(name))
-            {
-                return DeleteWarp(player, name);
-            }
-            else if (action.ToLower() == "groupshare" && !string.IsNullOrEmpty(name))
-            {
-                return SetGroupShare(player, name);
-            }
-            else if (action.ToLower() == "shareoffline" && !string.IsNullOrEmpty(name))
-            {
-                return SetOfflineShare(player, name);
-            }
-            else if (!string.IsNullOrEmpty(action) && string.IsNullOrEmpty(name))
-            {
-                return TeleportToWarp(player, action);
-            }
-
-            return TextCommandResult.Error("Usage: /warp [warp_name], /warp set [warp_name], /warp delete [warp_name], /warp groupshare [TRUE|FALSE], /warp shareoffline [TRUE|FALSE], /back (return to previous location), or use /warps to list waypoints");
-        }
-
-        private TextCommandResult SetWarp(IServerPlayer player, string warpName)
-        {
-            string playerUID = player.PlayerUID;
-            Vec3d playerPos = player.Entity.ServerPos.XYZ;
-
-            // Initialize player warp dictionary if it doesn't exist
-            if (!playerWarps.ContainsKey(playerUID))
-            {
-                playerWarps[playerUID] = new Dictionary<string, WarpData>();
-            }
-
-            // Get unique warp name to handle conflicts within player's collection
-            string uniqueName = GetUniquePlayerWarpName(playerUID, warpName);
-
-            // Save the warp point with owner information
-            var warpData = new WarpData(playerPos, player.PlayerName, player.PlayerUID);
-            playerWarps[playerUID][uniqueName] = warpData;
-
-            SaveWarpData();
-
-            string message = uniqueName == warpName 
-                ? $"Personal waypoint '{uniqueName}' set at coordinates: {(int)playerPos.X}, {(int)playerPos.Y}, {(int)playerPos.Z}"
-                : $"Personal waypoint '{uniqueName}' set at coordinates: {(int)playerPos.X}, {(int)playerPos.Y}, {(int)playerPos.Z} (renamed due to conflict)";
-
-            return TextCommandResult.Success(message);
-        }
-
-        private TextCommandResult TeleportToWarp(IServerPlayer player, string warpName)
-        {
-            var availableWarps = GetAvailableWarps(player);
-
-            if (!availableWarps.ContainsKey(warpName))
-            {
-                return TextCommandResult.Error($"Waypoint '{warpName}' not found in your available waypoints");
-            }
-
-            WarpData warpData = availableWarps[warpName];
-            Vec3d warpPos = warpData.Position;
-
-            // Store current location for /back command
-            string playerUID = player.PlayerUID;
-            Vec3d currentPos = player.Entity.ServerPos.XYZ;
-            playerPreviousLocations[playerUID] = currentPos;
-
-            // Teleport the player
-            player.Entity.TeleportToDouble(warpPos.X, warpPos.Y, warpPos.Z);
-
-            return TextCommandResult.Success($"Teleported to waypoint '{warpName}' (created by {warpData.OwnerName})");
-        }
-
-        private TextCommandResult ListWarps(IServerPlayer player)
-        {
-            var availableWarps = GetAvailableWarps(player);
-
-            if (availableWarps.Count == 0)
-            {
-                return TextCommandResult.Success("No waypoints available");
-            }
-
-            string warpList = "Available waypoints:\n";
-            foreach (var kvp in availableWarps.OrderBy(w => w.Key))
-            {
-                WarpData warpData = kvp.Value;
-                Vec3d pos = warpData.Position;
-                warpList += $"- {kvp.Key} ({warpData.OwnerName}): {(int)pos.X}, {(int)pos.Y}, {(int)pos.Z}\n";
-            }
-
-            return TextCommandResult.Success(warpList);
-        }
-
-        private TextCommandResult DeleteWarp(IServerPlayer player, string warpName)
-        {
-            string playerUID = player.PlayerUID;
-
-            if (!playerWarps.ContainsKey(playerUID) || !playerWarps[playerUID].ContainsKey(warpName))
-            {
-                return TextCommandResult.Error($"You don't have a personal waypoint named '{warpName}'");
-            }
-
-            playerWarps[playerUID].Remove(warpName);
-
-            SaveWarpData();
-
-            return TextCommandResult.Success($"Your personal waypoint '{warpName}' deleted");
-        }
-
-        private TextCommandResult SetGroupShare(IServerPlayer player, string value)
-        {
-            string playerUID = player.PlayerUID;
-
-            if (string.IsNullOrEmpty(value))
-            {
-                return TextCommandResult.Error("Usage: /warp groupshare [TRUE|FALSE]");
-            }
-
-            bool enableSharing;
-            if (value.ToUpper() == "TRUE")
-            {
-                enableSharing = true;
-            }
-            else if (value.ToUpper() == "FALSE")
-            {
-                enableSharing = false;
-            }
-            else
-            {
-                return TextCommandResult.Error("Usage: /warp groupshare [TRUE|FALSE]");
-            }
-
-            playerSharingEnabled[playerUID] = enableSharing;
-            SaveWarpData();
-
-            string message = enableSharing 
-                ? "Waypoint sharing enabled. Group members can use your waypoints."
-                : "Waypoint sharing disabled. Your waypoints are now private.";
-
-            return TextCommandResult.Success(message);
-        }
-
-        private TextCommandResult SetOfflineShare(IServerPlayer player, string value)
-        {
-            string playerUID = player.PlayerUID;
-
-            if (string.IsNullOrEmpty(value))
-            {
-                return TextCommandResult.Error("Usage: /warp shareoffline [TRUE|FALSE]");
-            }
-
-            // Check if player has group sharing enabled first
-            if (!playerSharingEnabled.ContainsKey(playerUID) || !playerSharingEnabled[playerUID])
-            {
-                return TextCommandResult.Error("You must enable group sharing first with '/warp groupshare TRUE' before enabling offline sharing.");
-            }
-
-            bool enableOfflineSharing;
-            if (value.ToUpper() == "TRUE")
-            {
-                enableOfflineSharing = true;
-            }
-            else if (value.ToUpper() == "FALSE")
-            {
-                enableOfflineSharing = false;
-            }
-            else
-            {
-                return TextCommandResult.Error("Usage: /warp shareoffline [TRUE|FALSE]");
-            }
-
-            playerOfflineSharingEnabled[playerUID] = enableOfflineSharing;
-            SaveWarpData();
-
-            string message = enableOfflineSharing 
-                ? "Offline waypoint sharing enabled. Group members can use your waypoints even when you're offline."
-                : "Offline waypoint sharing disabled. Group members can only use your waypoints when you're online.";
-
-            return TextCommandResult.Success(message);
-        }
+        #region Persistence (per-world)
 
         private void LoadWarpData()
         {
             try
             {
-                // Try to load world-specific data from world save file
-                byte[] worldData = serverApi.WorldManager.SaveGame.GetData("warpmod_data");
-                if (worldData != null)
+                byte[] worldData = sapi.WorldManager.SaveGame.GetData(SaveKey);
+                if (worldData is { Length: > 0 })
                 {
-                    try
+                    var loaded = DeserializeData(worldData);
+                    if (loaded != null)
                     {
-                        string jsonData = System.Text.Encoding.UTF8.GetString(worldData);
-                        // Use a simple approach - leverage VS's existing JSON handling through a temporary mod config
-                        string tempFileName = $"warpmod_temp_load_{Guid.NewGuid():N}.json";
-                        System.IO.File.WriteAllText(System.IO.Path.Combine(serverApi.GetOrCreateDataPath("ModConfig"), tempFileName), jsonData);
-                        var loadedWarpModData = serverApi.LoadModConfig<WarpModData>(tempFileName);
-                        System.IO.File.Delete(System.IO.Path.Combine(serverApi.GetOrCreateDataPath("ModConfig"), tempFileName));
-                        
-                        if (loadedWarpModData != null)
-                        {
-                            playerWarps = loadedWarpModData.PlayerWarps ?? new Dictionary<string, Dictionary<string, WarpData>>();
-                            playerSharingEnabled = loadedWarpModData.PlayerSharingEnabled ?? new Dictionary<string, bool>();
-                            playerOfflineSharingEnabled = loadedWarpModData.PlayerOfflineSharingEnabled ?? new Dictionary<string, bool>();
-                            serverApi.Logger.Debug("Loaded world-specific warp data successfully");
-                            return;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        serverApi.Logger.Error($"Failed to deserialize world-specific warp data: {ex.Message}");
+                        playerWarps = loaded.PlayerWarps ?? new();
+                        playerSharingEnabled = loaded.PlayerSharingEnabled ?? new();
+                        playerOfflineSharingEnabled = loaded.PlayerOfflineSharingEnabled ?? new();
+                        sapi.Logger.Notification($"[warpmod] Loaded warps for {playerWarps.Count} player(s) from this world.");
+                        return;
                     }
                 }
 
-                // Check if this world has already been migrated by looking for a migration marker
-                byte[] migrationMarker = serverApi.WorldManager.SaveGame.GetData("warpmod_migrated");
-                if (migrationMarker == null)
-                {
-                    // Migration: Check for existing global mod config data and migrate it to world-specific storage
-                    var globalWarpModData = serverApi.LoadModConfig<WarpModData>("warpmod_data_v2.json");
-                    if (globalWarpModData != null)
-                    {
-                        playerWarps = globalWarpModData.PlayerWarps ?? new Dictionary<string, Dictionary<string, WarpData>>();
-                        playerSharingEnabled = globalWarpModData.PlayerSharingEnabled ?? new Dictionary<string, bool>();
-                        SaveWarpData(); // Save to world-specific storage
-                        // Mark this world as migrated
-                        serverApi.WorldManager.SaveGame.StoreData("warpmod_migrated", System.Text.Encoding.UTF8.GetBytes("true"));
-                        serverApi.Logger.Warning("Migrated global warp data to world-specific storage");
-                        return;
-                    }
-
-                    // Fallback: Try to migrate from old player-based format
-                    var loadedPlayerData = serverApi.LoadModConfig<Dictionary<string, Dictionary<string, WarpData>>>("warpmod_player_data.json");
-                    if (loadedPlayerData != null)
-                    {
-                        playerWarps = loadedPlayerData;
-                        // Default all existing players to sharing enabled for backward compatibility
-                        foreach (var playerUID in playerWarps.Keys)
-                        {
-                            if (!playerSharingEnabled.ContainsKey(playerUID))
-                            {
-                                playerSharingEnabled[playerUID] = true;
-                            }
-                        }
-                        SaveWarpData(); // Save in world-specific format
-                        // Mark this world as migrated
-                        serverApi.WorldManager.SaveGame.StoreData("warpmod_migrated", System.Text.Encoding.UTF8.GetBytes("true"));
-                        serverApi.Logger.Warning("Migrated warp data from old player-based format to world-specific storage");
-                        return;
-                    }
-
-                    // Fallback: Try to migrate from old group-based format
-                    var loadedGroupData = serverApi.LoadModConfig<Dictionary<string, Dictionary<string, WarpData>>>("warpmod_data.json");
-                    if (loadedGroupData != null)
-                    {
-                        MigrateFromGroupFormat(loadedGroupData);
-                        SaveWarpData(); // Save in world-specific format
-                        // Mark this world as migrated
-                        serverApi.WorldManager.SaveGame.StoreData("warpmod_migrated", System.Text.Encoding.UTF8.GetBytes("true"));
-                        serverApi.Logger.Warning("Migrated warp data from old group-based format to world-specific storage");
-                        return;
-                    }
-
-                    // No data to migrate, mark as migrated anyway to prevent future migration attempts
-                    serverApi.WorldManager.SaveGame.StoreData("warpmod_migrated", System.Text.Encoding.UTF8.GetBytes("true"));
-                }
+                // No per-world data yet, so this world simply starts with no warps.
+                // Legacy GLOBAL warps are deliberately NOT auto-imported here: that file is shared
+                // across every save, so doing it automatically seeded each new world with the same
+                // data. Run /warpimport in the world you actually want them in instead.
             }
             catch (Exception e)
             {
-                serverApi.Logger.Error("Failed to load warp data: " + e.Message);
-            }
-        }
-
-        private void MigrateFromGroupFormat(Dictionary<string, Dictionary<string, WarpData>> oldGroupData)
-        {
-            foreach (var groupEntry in oldGroupData)
-            {
-                foreach (var warpEntry in groupEntry.Value)
-                {
-                    string ownerUID = warpEntry.Value.OwnerUID;
-                    
-                    // Initialize player collection if needed
-                    if (!playerWarps.ContainsKey(ownerUID))
-                    {
-                        playerWarps[ownerUID] = new Dictionary<string, WarpData>();
-                    }
-                    
-                    // Add warp to owner's personal collection
-                    playerWarps[ownerUID][warpEntry.Key] = warpEntry.Value;
-                }
+                sapi.Logger.Error("[warpmod] Failed to load warp data: " + e);
             }
         }
 
@@ -690,31 +484,107 @@ namespace WarpMod
         {
             try
             {
-                var warpModData = new WarpModData
+                var data = new WarpModData
                 {
                     PlayerWarps = playerWarps,
                     PlayerSharingEnabled = playerSharingEnabled,
                     PlayerOfflineSharingEnabled = playerOfflineSharingEnabled
                 };
 
-                // Save to world-specific storage using world data APIs
-                string tempFileName = $"warpmod_temp_save_{Guid.NewGuid():N}.json";
-                string tempFilePath = System.IO.Path.Combine(serverApi.GetOrCreateDataPath("ModConfig"), tempFileName);
-                
-                // Use VS's StoreModConfig to generate proper JSON, then read it back
-                serverApi.StoreModConfig(warpModData, tempFileName);
-                string jsonData = System.IO.File.ReadAllText(tempFilePath);
-                System.IO.File.Delete(tempFilePath);
-                
-                // Store in world-specific storage
-                byte[] dataBytes = System.Text.Encoding.UTF8.GetBytes(jsonData);
-                serverApi.WorldManager.SaveGame.StoreData("warpmod_data", dataBytes);
-                serverApi.Logger.Debug("Saved warp data to world-specific storage");
+                sapi.WorldManager.SaveGame.StoreData(SaveKey, SerializeData(data));
             }
             catch (Exception e)
             {
-                serverApi.Logger.Error("Failed to save warp data: " + e.Message);
+                sapi.Logger.Error("[warpmod] Failed to save warp data: " + e);
             }
         }
+
+        private bool MigrateLegacyGlobalConfig()
+        {
+            // 1) v2 wrapper format (warps + sharing flags).
+            var v2 = sapi.LoadModConfig<WarpModData>("warpmod_data_v2.json");
+            if (v2 != null)
+            {
+                playerWarps = v2.PlayerWarps ?? new();
+                playerSharingEnabled = v2.PlayerSharingEnabled ?? new();
+                playerOfflineSharingEnabled = v2.PlayerOfflineSharingEnabled ?? new();
+                SaveWarpData();
+                sapi.Logger.Notification("[warpmod] Migrated legacy v2 global config into this world.");
+                return true;
+            }
+
+            // 2) Player-keyed format.
+            var perPlayer = sapi.LoadModConfig<Dictionary<string, Dictionary<string, WarpData>>>("warpmod_player_data.json");
+            if (perPlayer != null)
+            {
+                playerWarps = perPlayer;
+                foreach (var uid in playerWarps.Keys) playerSharingEnabled[uid] = true; // back-compat default
+                SaveWarpData();
+                sapi.Logger.Notification("[warpmod] Migrated legacy player-format global config into this world.");
+                return true;
+            }
+
+            // 3) Oldest group-keyed format -> flatten into per-player collections by OwnerUID.
+            var perGroup = sapi.LoadModConfig<Dictionary<string, Dictionary<string, WarpData>>>("warpmod_data.json");
+            if (perGroup != null)
+            {
+                foreach (var group in perGroup.Values)
+                {
+                    foreach (var entry in group)
+                    {
+                        string ownerUID = entry.Value?.OwnerUID;
+                        if (string.IsNullOrEmpty(ownerUID)) continue;
+
+                        if (!playerWarps.TryGetValue(ownerUID, out var w))
+                        {
+                            w = new Dictionary<string, WarpData>();
+                            playerWarps[ownerUID] = w;
+                        }
+                        w[entry.Key] = entry.Value;
+                    }
+                }
+                SaveWarpData();
+                sapi.Logger.Notification("[warpmod] Migrated legacy group-format global config into this world.");
+                return true;
+            }
+
+            return false;
+        }
+
+        // JsonUtil lives in Vintagestory.API.Common and is Newtonsoft-backed, so no extra reference is needed.
+        private static byte[] SerializeData(WarpModData data) => JsonUtil.ToBytes(data);
+
+        private static WarpModData DeserializeData(byte[] bytes) => JsonUtil.FromBytes<WarpModData>(bytes);
+
+        #endregion
+
+        #region Helpers
+
+        // Returns baseName if free, else baseName(1), baseName(2), ... using the supplied existence check.
+        // Note: System.Func is qualified because Vintagestory.API.Common also defines a 'Func' delegate.
+        private static string MakeUnique(string baseName, System.Func<string, bool> exists)
+        {
+            if (!exists(baseName)) return baseName;
+
+            int n = 1;
+            string candidate;
+            do { candidate = $"{baseName}({n++})"; } while (exists(candidate));
+            return candidate;
+        }
+
+        private static bool TryParseToggle(string s, out bool value)
+        {
+            value = false;
+            if (string.IsNullOrWhiteSpace(s)) return false;
+
+            switch (s.Trim().ToLowerInvariant())
+            {
+                case "true": case "on": case "yes": case "1": value = true; return true;
+                case "false": case "off": case "no": case "0": value = false; return true;
+                default: return false;
+            }
+        }
+
+        #endregion
     }
 }

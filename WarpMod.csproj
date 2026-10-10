@@ -1,22 +1,74 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  
-  <!-- Import optional custom configuration -->
+
+  <!-- Import optional custom configuration (e.g. a local VintagestoryPath / ModsFolder override). -->
   <Import Project="WarpMod.props" Condition="Exists('WarpMod.props')" />
-  
+
   <PropertyGroup>
-    <TargetFramework>net472</TargetFramework>
-    <!-- Default Vintagestory path - can be overridden in WarpMod.props -->
+    <!--
+      Target framework MUST match the game's runtime:
+        VS 1.20.x  -> net7.0
+        VS 1.21.x  -> net8.0
+        VS 1.22.x  -> net10.0   (current)
+      Building for the wrong one is what produced the "Field not found" / load failures.
+    -->
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+
+    <!-- Default install path; override in WarpMod.props if the game lives elsewhere (e.g. E:\VintageStory\Vintagestory). -->
     <VintagestoryPath Condition="'$(VintagestoryPath)' == ''">$(APPDATA)\Vintagestory</VintagestoryPath>
+
+    <!-- Where the packaged mod zip gets dropped. Override in WarpMod.props if your data folder differs. -->
+    <ModsFolder Condition="'$(ModsFolder)' == ''">$(APPDATA)\VintagestoryData\Mods</ModsFolder>
+
+    <!-- Set to false (e.g. -p:PackageMod=false) to skip auto-packaging on a build. -->
+    <PackageMod Condition="'$(PackageMod)' == ''">true</PackageMod>
   </PropertyGroup>
-  
+
   <ItemGroup>
     <Reference Include="VintagestoryAPI">
       <HintPath>$(VintagestoryPath)\VintagestoryAPI.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <Reference Include="VSSurvivalMod">
-      <HintPath>$(VintagestoryPath)\Mods\VSSurvivalMod.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
   </ItemGroup>
+
+  <!--
+    After each build, assemble the loadable mod and drop it straight into the Mods folder:
+      - modinfo.json, modicon.png and the built DLL go at the ROOT of the zip (required by VS)
+      - the assets/ subtree is copied with its folder structure preserved
+      - the zip overwrites any previous build of the same name
+  -->
+  <Target Name="PackageMod" AfterTargets="Build" Condition="'$(PackageMod)' == 'true'">
+
+    <PropertyGroup>
+      <PackageStagingDir>$(MSBuildProjectDirectory)\obj\modpackage</PackageStagingDir>
+      <ModZipPath>$(ModsFolder)\$(AssemblyName).zip</ModZipPath>
+    </PropertyGroup>
+
+    <!-- Start from a clean staging folder. -->
+    <RemoveDir Directories="$(PackageStagingDir)" />
+    <MakeDir Directories="$(PackageStagingDir)" />
+
+    <!-- Root-level files. -->
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PackageStagingDir)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\modinfo.json" DestinationFolder="$(PackageStagingDir)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\modicon.png" DestinationFolder="$(PackageStagingDir)"
+          Condition="Exists('$(MSBuildProjectDirectory)\modicon.png')" />
+
+    <!-- assets/ subtree, structure preserved. -->
+    <ItemGroup>
+      <_AssetFiles Include="$(MSBuildProjectDirectory)\assets\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_AssetFiles)"
+          DestinationFiles="@(_AssetFiles->'$(PackageStagingDir)\assets\%(RecursiveDir)%(Filename)%(Extension)')"
+          Condition="'@(_AssetFiles)' != ''" />
+
+    <!-- Ensure the Mods folder exists, then zip straight into it (overwriting any old build). -->
+    <MakeDir Directories="$(ModsFolder)" />
+    <ZipDirectory SourceDirectory="$(PackageStagingDir)" DestinationFile="$(ModZipPath)" Overwrite="true" />
+
+    <Message Importance="high" Text="[warpmod] Packaged mod -> $(ModZipPath)" />
+  </Target>
+
 </Project>
